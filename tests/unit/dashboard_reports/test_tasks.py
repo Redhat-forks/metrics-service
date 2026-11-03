@@ -124,7 +124,7 @@ def mock_collect_data_deps():
         patch("apps.dashboard_reports.tasks._process_batches") as mock_batches,
         patch("apps.dashboard_reports.tasks.log_task_execution") as mock_log,
     ):
-        mock_params.return_value = ("awx", since, until, 5000)
+        mock_params.return_value = (since, until, 5000)
         mock_db_conn.return_value = MagicMock()
         mock_id_range.return_value = (100, 200)
         mock_batches.return_value = (42, None)
@@ -185,7 +185,7 @@ class TestCollectData:
         mock_params, *_ = mock_collect_data_deps
         since = datetime(2024, 2, 1, tzinfo=UTC)
         until = datetime(2024, 1, 1, tzinfo=UTC)
-        mock_params.return_value = ("awx", since, until, 5000)
+        mock_params.return_value = (since, until, 5000)
 
         result = _collect_data("test_task")
 
@@ -687,7 +687,7 @@ class TestCleanupDashboardReportsOldData:
         _, kwargs = mock_create_task_result_cleanup.call_args
         assert kwargs["data"]["retention_days"] == 60
 
-    def test_cleanup_passes_db_name_to_get_retention_days(
+    def test_cleanup_ignores_database_override(
         self,
         with_controller_retention,
         mock_retention_days,
@@ -695,12 +695,12 @@ class TestCleanupDashboardReportsOldData:
         mock_log_task_execution,
         mock_create_task_result_cleanup,
     ):
-        """The 'awx_database' kwarg is forwarded to get_retention_days so retention and collection use the same connection."""
+        """The obsolete 'awx_database' kwarg is ignored and the fixed AWX alias is used."""
         mock_jobdata_objects.objects.filter.return_value.count.return_value = 0
         cleanup_dashboard_reports_old_data(awx_database="custom_db")
-        mock_retention_days.assert_called_once_with("custom_db")
+        mock_retention_days.assert_called_once_with()
 
-    def test_cleanup_passes_default_db_name_when_no_database_kwarg(
+    def test_cleanup_uses_fixed_awx_alias(
         self,
         with_controller_retention,
         mock_retention_days,
@@ -708,12 +708,12 @@ class TestCleanupDashboardReportsOldData:
         mock_log_task_execution,
         mock_create_task_result_cleanup,
     ):
-        """When 'awx_database' kwarg is absent, get_retention_days is called with the 'awx' alias."""
+        """When no database override is present, retention uses the fixed AWX alias."""
         mock_jobdata_objects.objects.filter.return_value.count.return_value = 0
         cleanup_dashboard_reports_old_data()
-        mock_retention_days.assert_called_once_with("awx")
+        mock_retention_days.assert_called_once_with()
 
-    def test_cleanup_deprecated_database_kwarg_still_honored(
+    def test_cleanup_ignores_deprecated_database_kwarg(
         self,
         with_controller_retention,
         mock_retention_days,
@@ -721,10 +721,10 @@ class TestCleanupDashboardReportsOldData:
         mock_log_task_execution,
         mock_create_task_result_cleanup,
     ):
-        """The pre-rename 'database' kwarg still resolves db_name rather than being silently dropped."""
+        """The pre-rename 'database' kwarg is ignored rather than selecting another database."""
         mock_jobdata_objects.objects.filter.return_value.count.return_value = 0
         cleanup_dashboard_reports_old_data(database="legacy_db")
-        mock_retention_days.assert_called_once_with("legacy_db")
+        mock_retention_days.assert_called_once_with()
 
     def test_cleanup_deprecated_retention_period_days_kwarg_still_honored(
         self, mock_jobdata_objects, mock_log_task_execution, mock_create_task_result_cleanup
@@ -829,12 +829,11 @@ class TestResolveCollectionParams:
 
         since = datetime(2024, 1, 1, tzinfo=UTC)
         until = datetime(2024, 2, 1, tzinfo=UTC)
-        db_name, got_since, got_until, batch_size = _resolve_collection_params(
+        got_since, got_until, batch_size = _resolve_collection_params(
             "collect_dashboard_reports_data", {"since": since.isoformat(), "until": until.isoformat()}
         )
         assert got_since == since
         assert got_until == until
-        assert db_name == "awx"
         mock_jobdata.last_finished_timestamp.assert_not_called()
 
     @patch("apps.dashboard_reports.tasks.JobData")
@@ -842,7 +841,7 @@ class TestResolveCollectionParams:
         """When since is absent and last_finished_timestamp() has a value, it is used as since."""
         ts = datetime(2024, 3, 15, tzinfo=UTC)
         mock_jobdata.last_finished_timestamp.return_value = ts
-        _, got_since, _, _ = _resolve_collection_params("collect_dashboard_reports_data", {})
+        got_since, _, _ = _resolve_collection_params("collect_dashboard_reports_data", {})
         assert got_since == ts
 
     @patch("apps.dashboard_reports.tasks._use_controller_retention", return_value=True)
@@ -856,39 +855,30 @@ class TestResolveCollectionParams:
         until = datetime(2024, 6, 1, tzinfo=UTC)
 
         with override_settings(DASHBOARD_COLLECTION={"BACKFILL_BATCH_SIZE": 500}):
-            _, got_since, _, batch_size = _resolve_collection_params(
+            got_since, _, batch_size = _resolve_collection_params(
                 "collect_dashboard_reports_data", {"until": until.isoformat()}
             )
 
         expected_since = (until - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
         assert got_since == expected_since
         assert batch_size == 500
-        mock_retention.assert_called_once_with("awx")
+        mock_retention.assert_called_once_with()
 
+    @pytest.mark.parametrize("database_kwargs", [{"awx_database": "custom_db"}, {"database": "legacy_db"}])
     @patch("apps.dashboard_reports.tasks._use_controller_retention", return_value=True)
     @patch("apps.dashboard_reports.tasks.get_retention_days", return_value=30)
     @patch("apps.dashboard_reports.tasks.JobData")
-    def test_custom_database_kwarg_forwarded_to_retention(self, mock_jobdata, mock_retention, _mock_use_ctrl):
-        """When controller retention is enabled and no prior timestamp exists, db_name is passed to get_retention_days."""
+    def test_database_overrides_are_ignored(self, mock_jobdata, mock_retention, _mock_use_ctrl, database_kwargs):
+        """Both obsolete database kwargs are ignored while retention stays on the fixed AWX alias."""
         mock_jobdata.last_finished_timestamp.return_value = None
-        until = datetime(2024, 6, 1, tzinfo=UTC)
-        _resolve_collection_params(
-            "collect_dashboard_reports_data", {"awx_database": "custom_db", "until": until.isoformat()}
-        )
-        mock_retention.assert_called_once_with("custom_db")
-
-    @patch("apps.dashboard_reports.tasks.JobData")
-    def test_custom_database_kwarg(self, mock_jobdata):
-        """The 'awx_database' kwarg overrides the DEFAULT_AWX_DB_NAME."""
-        mock_jobdata.last_finished_timestamp.return_value = datetime(2024, 1, 1, tzinfo=UTC)
-        db_name, *_ = _resolve_collection_params("collect_dashboard_reports_data", {"awx_database": "custom_db"})
-        assert db_name == "custom_db"
+        _resolve_collection_params("collect_dashboard_reports_data", database_kwargs)
+        mock_retention.assert_called_once_with()
 
     @patch("apps.dashboard_reports.tasks.JobData")
     def test_default_batch_size_applied(self, mock_jobdata):
         """BACKFILL_BATCH_SIZE defaults to 5_000 when not set."""
         mock_jobdata.last_finished_timestamp.return_value = datetime(2024, 1, 1, tzinfo=UTC)
-        _, _, _, batch_size = _resolve_collection_params("collect_dashboard_reports_data", {})
+        _, _, batch_size = _resolve_collection_params("collect_dashboard_reports_data", {})
         assert batch_size == 5_000
 
     @patch("apps.dashboard_reports.tasks.JobData")
@@ -911,22 +901,6 @@ class TestResolveCollectionParams:
         mock_jobdata.last_finished_timestamp.return_value = None
         with pytest.raises(ValueError, match="Retention days must be > 0"):
             _resolve_collection_params("collect_dashboard_reports_data", {})
-
-    @patch("apps.dashboard_reports.tasks.JobData")
-    def test_deprecated_database_kwarg_still_honored(self, mock_jobdata):
-        """The old 'database' kwarg name (pre-rename) still resolves db_name, with a warning."""
-        mock_jobdata.last_finished_timestamp.return_value = datetime(2024, 1, 1, tzinfo=UTC)
-        db_name, *_ = _resolve_collection_params("collect_dashboard_reports_data", {"database": "legacy_db"})
-        assert db_name == "legacy_db"
-
-    @patch("apps.dashboard_reports.tasks.JobData")
-    def test_new_kwarg_takes_precedence_over_deprecated(self, mock_jobdata):
-        """When both 'awx_database' and 'database' are given, the new name wins."""
-        mock_jobdata.last_finished_timestamp.return_value = datetime(2024, 1, 1, tzinfo=UTC)
-        db_name, *_ = _resolve_collection_params(
-            "collect_dashboard_reports_data", {"awx_database": "new_db", "database": "old_db"}
-        )
-        assert db_name == "new_db"
 
 
 # ---------------------------------------------------------------------------
@@ -1084,11 +1058,11 @@ class TestGetRetentionDays:
 
     @patch("apps.dashboard_reports.tasks.fetch_retention_settings")
     @patch("apps.dashboard_reports.tasks.get_db_connection")
-    def test_custom_db_name_passed_to_connection(self, mock_conn, mock_fetch):
-        """A custom db_name argument is forwarded to get_db_connection."""
+    def test_fixed_awx_db_name_passed_to_connection(self, mock_conn, mock_fetch):
+        """The retention lookup always uses the fixed 'awx' alias."""
         mock_fetch.return_value = ([self._row(retention_days=30)], 1)
-        get_retention_days("custom_db")
-        mock_conn.assert_called_once_with("custom_db")
+        get_retention_days()
+        mock_conn.assert_called_once_with("awx")
 
 
 # ---------------------------------------------------------------------------
@@ -1579,13 +1553,13 @@ class TestBackfillDashboardOrganizationNames:
         assert result["status"] == "success"
         assert result["updated_records"] == 1
 
-    def test_uses_awx_database_kwarg(self, mock_fetch_orgs: MagicMock) -> None:
-        """The AWX database name can be overridden via the awx_database kwarg."""
+    def test_ignores_awx_database_kwarg(self, mock_fetch_orgs: MagicMock) -> None:
+        """The obsolete AWX database override does not change the configured alias."""
         self._job(1, organization_id=1)
         with patch("apps.dashboard_reports.tasks.get_db_connection") as mock_conn:
             backfill_dashboard_organization_names(awx_database="awx_other")
 
-        mock_conn.assert_called_once_with("awx_other")
+        mock_conn.assert_called_once_with("awx")
 
     @pytest.mark.parametrize("batch_size", [0, -1, "abc", True, 2.9, None])
     def test_invalid_batch_size_returns_error(self, mock_fetch_orgs: MagicMock, batch_size: Any) -> None:
@@ -1636,7 +1610,7 @@ class TestBackfillDashboardJobTypes:
         self._job(102, job_type="job")
         mock_fetch.side_effect = [{100: "job"}, {101: "systemjob"}]
 
-        result = backfill_dashboard_job_types(batch_size=1)
+        result = backfill_dashboard_job_types(batch_size=1, awx_database="custom_db")
 
         assert result["status"] == "success"
         assert result["updated_records"] == 2
